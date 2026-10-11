@@ -24,6 +24,7 @@ from complex.geom import get_collection  # noqa: E402
 from complex.materials import build_materials  # noqa: E402
 from complex.drawn import build_drawn_tower  # noqa: E402
 from complex.towers import TOWER_A, build_hotel  # noqa: E402
+from complex import lighting  # noqa: E402
 
 # Camera recovered from the reference aerial image (2000 x 1413 px):
 # focal length 2124 px, 37.2 deg down, heading 8.7 deg east of north, 200 m up.
@@ -86,6 +87,10 @@ def parse_args():
     p.add_argument('--target', help='custom camera target x,y,z')
     p.add_argument('--lens', type=float, default=30.0)
     p.add_argument('--res', help='render size WxH before --scale, e.g. 2000x1413')
+    p.add_argument('--hero', metavar='DIR', help='render the hero stills (HERO_VIEWS) into DIR/<name>.png')
+    p.add_argument('--hero-views', help='comma-separated subset of the hero views, e.g. reference,deck')
+    p.add_argument('--hero-res', default='1920x1080',
+                   help='hero size WxH before --scale (the reference view keeps the reference aspect at this width)')
     return p.parse_args(argv)
 
 
@@ -121,6 +126,9 @@ EXTRA_VIEWS = {
     'deck': dict(location=(86.0, 300.0, 68.0), target=(36.0, 236.0, 14.0), lens=30.0),
 }
 
+# the stills --hero renders (in this order); any name of EXTRA_VIEWS or 'reference'
+HERO_VIEWS = ['reference', 'deck', 'river aerial', 'avenue street', 'river street']
+
 
 def add_view(scene, name, location, target, lens):
     cd = bpy.data.cameras.new(name)
@@ -136,46 +144,56 @@ def add_view(scene, name, location, target, lens):
 
 
 def setup_light(scene):
-    sun_data = bpy.data.lights.new('Sun', 'SUN')
-    sun_data.energy = 3.2
-    sun_data.angle = math.radians(1.5)
-    sun_data.color = (1.0, 0.96, 0.9)
-    sun = bpy.data.objects.new('Sun', sun_data)
-    scene.collection.objects.link(sun)
-    # morning sun from the east-south-east, shadows fall to the west-north-west
-    az, el = math.radians(112), math.radians(38)
-    d = Vector((-math.sin(az) * math.cos(el), -math.cos(az) * math.cos(el), -math.sin(el)))
-    sun.rotation_euler = d.to_track_quat('-Z', 'Y').to_euler()
-
-    world = bpy.data.worlds.new('Sky')
-    scene.world = world
-    world.use_nodes = True
-    nt = world.node_tree
-    bg = nt.nodes['Background']
-    tc = nt.nodes.new('ShaderNodeTexCoord')
-    sep = nt.nodes.new('ShaderNodeSeparateXYZ')
-    ramp = nt.nodes.new('ShaderNodeValToRGB')
-    nt.links.new(tc.outputs['Generated'], sep.inputs[0])
-    nt.links.new(sep.outputs['Z'], ramp.inputs['Fac'])
-    ramp.color_ramp.elements[0].position = 0.5
-    ramp.color_ramp.elements[0].color = (0.80, 0.86, 0.92, 1)
-    ramp.color_ramp.elements[1].position = 0.85
-    ramp.color_ramp.elements[1].color = (0.30, 0.50, 0.80, 1)
-    nt.links.new(ramp.outputs['Color'], bg.inputs['Color'])
-    bg.inputs['Strength'].default_value = 1.1
+    """HDRI world (sun hotspot clamped, clean sky for the camera) and the sun lamp: complex/lighting.py."""
+    meas = lighting.setup_world(scene)
+    return lighting.setup_sun(scene, meas)
 
 
 def setup_render(scene, scale, samples):
-    scene.render.engine = 'CYCLES'
-    scene.cycles.device = 'CPU'
-    scene.cycles.samples = samples
-    scene.cycles.use_denoising = True
-    scene.cycles.max_bounces = 6
-    scene.render.resolution_percentage = int(scale * 100)
-    scene.view_settings.view_transform = 'Standard'
-    scene.view_settings.look = 'None'
-    scene.view_settings.exposure = 0.0
-    scene.render.film_transparent = False
+    """Cycles settings and colour management (complex/lighting.py), plus the Cycles-only glass/metal
+    tuning of the materials (undone for the glTF export by lighting.web_materials())."""
+    lighting.setup_render(scene, scale, samples)
+    lighting.tune_materials()
+
+
+def slug(name):
+    return name.strip().lower().replace(' ', '-')
+
+
+def render_still(scene, cam, path, res):
+    scene.camera = cam
+    scene.render.resolution_x, scene.render.resolution_y = res
+    scene.render.filepath = os.path.abspath(path)
+    bpy.ops.render.render(write_still=True)
+
+
+def render_heroes(scene, cams, out_dir, names=None, res='1920x1080'):
+    """Hero stills for the website and marketing, one PNG per named view, in one run."""
+    w, h = map(int, res.lower().split('x'))
+    names = [n.strip() for n in names.split(',')] if names else HERO_VIEWS
+    os.makedirs(out_dir, exist_ok=True)
+    for name in names:
+        cam = cams.get(name)
+        if cam is None:
+            print(f'[hero] unknown view {name!r}; known: {", ".join(cams)}')
+            continue
+        size = (w, round(w * REF_CAMERA['res'][1] / REF_CAMERA['res'][0])) if name == 'reference' else (w, h)
+        path = os.path.join(out_dir, slug(name) + '.png')
+        render_still(scene, cam, path, size)
+        print(f'[hero] {name} -> {path}')
+
+
+def export_glb(path):
+    """glTF for the web viewer: materials exactly as materials.py made them (no Cycles tuning), and
+    without what the viewer draws itself (trees, cars, people) or does not need (Blender-only
+    interiors behind the glass)."""
+    for col in list(bpy.data.collections):
+        if col.name in ('Trees', 'Cars', 'People') or col.name.startswith('Interiors'):
+            for ob in list(col.all_objects):
+                bpy.data.objects.remove(ob)
+    with lighting.web_materials():
+        bpy.ops.export_scene.gltf(filepath=path, export_format='GLB', export_apply=True,
+                                  export_cameras=False, export_lights=False, export_extras=True)
 
 
 def main():
@@ -217,25 +235,19 @@ def main():
         json.dump(dict(site_centre=SITE_CENTRE, towers=towers,
                        tree_protos=[dict(h=h, r=r, light=l) for h, r, l in site.TREE_PROTOS], trees=site.TREES,
                        cars=site.CARS, people=site.PEOPLE), f)
-    if not args.no_glb:
-        # the viewer draws trees, cars and people itself (instanced), so leave them out of the GLB
-        for name in ('Trees', 'Cars', 'People'):
-            col = bpy.data.collections.get(name)
-            if col:
-                for ob in list(col.objects):
-                    bpy.data.objects.remove(ob)
-        bpy.ops.export_scene.gltf(filepath=out + '.glb', export_format='GLB', export_apply=True,
-                                  export_cameras=False, export_lights=False, export_extras=True)
+    # renders first (they need the trees, cars, people and interiors the export removes)
     if args.render:
-        scene.camera = views.get(args.view, ref_cam)
+        cam = views.get(args.view, ref_cam)
         if args.cam:
             loc = tuple(map(float, args.cam.split(',')))
             tgt = tuple(map(float, (args.target or '0,240,15').split(',')))
-            scene.camera = add_view(scene, 'Custom', loc, tgt, args.lens)
-        if args.res:
-            scene.render.resolution_x, scene.render.resolution_y = map(int, args.res.lower().split('x'))
-        scene.render.filepath = os.path.abspath(args.render)
-        bpy.ops.render.render(write_still=True)
+            cam = add_view(scene, 'Custom', loc, tgt, args.lens)
+        res = tuple(map(int, args.res.lower().split('x'))) if args.res else REF_CAMERA['res']
+        render_still(scene, cam, args.render, res)
+    if args.hero:
+        render_heroes(scene, dict(reference=ref_cam, **views), args.hero, args.hero_views, args.hero_res)
+    if not args.no_glb:
+        export_glb(out + '.glb')
 
 
 if __name__ == '__main__':
