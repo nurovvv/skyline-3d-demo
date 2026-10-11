@@ -8,8 +8,6 @@ import { MODEL_URL, toScene, towerByKey } from './config.js';
 import { groundTexture } from './textures.js';
 import { FACADE_MAPS } from './facade_maps.js';
 
-const GLASS = new Set(['Window glass', 'Curtain glass', 'Shop glass', 'Shop window', 'Gallery glass', 'Pool water', 'River']);
-
 const GROUND = {
   Grass: 'grass', Lawn: 'grass', Asphalt: 'asphalt', Paving: 'paving', Sidewalk: 'paving', 'Deck paving': 'deck',
   Cobble: 'cobble', 'Deck stone': 'stone', 'Pool mosaic': 'mosaic', 'Copper screen': 'copper', 'Rubber blue': 'rubber',
@@ -17,6 +15,21 @@ const GROUND = {
   ...FACADE_MAPS,
 };
 const groundTex = {};
+
+// Glass stays opaque (no transparency sorting) and mirror-smooth; what it shows comes from the Fresnel
+// reflection of the HDRI environment. Reflectance at normal incidence (F0) is that of coated double
+// glazing rather than a single 4 % pane, so facades read as glass from afar like on the renders;
+// at grazing angles Fresnel takes every pane to a full mirror of the sky. Water is n = 1.33 (2 %).
+const GLASS_LOOK = {
+  'Window glass': { f0: 0.09, roughness: 0.04 },
+  'Curtain glass': { f0: 0.1, roughness: 0.03 },
+  'Shop glass': { f0: 0.08, roughness: 0.04 },
+  'Shop window': { f0: 0.07, roughness: 0.06 },
+  'Gallery glass': { f0: 0.06, roughness: 0.08 },
+  'Pool water': { f0: 0.02, roughness: 0.03 },
+  River: { f0: 0.02, roughness: 0.14 },
+};
+const MATTE = new Set(['Leaves', 'Leaves light', 'Shrub', 'Grass', 'Lawn', 'Trunk', 'Embankment', 'Asphalt']);
 
 function tuneMaterial(m) {
   const g = GROUND[m.name];
@@ -26,19 +39,37 @@ function tuneMaterial(m) {
     m.color.set(0xffffff);
     m.needsUpdate = true;
   }
-  if (GLASS.has(m.name)) {
-    // lighter glass that picks up the sky
-    if (!['River', 'Pool water', 'Shop window', 'Gallery glass'].includes(m.name)) m.color.offsetHSL(0, -0.05, 0.12);
-    m.envMapIntensity = 1.2;
-    m.roughness = Math.max(0.06, Math.min(m.roughness, 0.12));
+  const glass = GLASS_LOOK[m.name];
+  if (glass) {
+    m.metalness = 0;
+    m.roughness = glass.roughness;
+    m.transparent = false;
+    if (m.isMeshPhysicalMaterial) {
+      // F0 = ((ior - 1) / (ior + 1))^2 * specularColor = 0.04 * specularColor for ior 1.5
+      m.ior = 1.5;
+      m.specularIntensity = 1;
+      m.specularColor.setScalar(glass.f0 / 0.04);
+    }
+    // a texture (facade_maps.js) carries its own look, e.g. rooms and curtains behind the pane;
+    // plain panes keep the Blender tint, a little lighter as tinted glass looks in daylight
+    if (!m.map && !['River', 'Pool water', 'Gallery glass'].includes(m.name)) m.color.offsetHSL(0, -0.03, 0.04);
   }
   if (m.name.startsWith('Stained')) m.emissiveIntensity = 0.25;
   if (m.name === 'Railing glass' || m.name === 'Railing glass dark' || m.name === 'Neighbour') {
     m.transparent = true;
     m.depthWrite = false;
     m.side = THREE.DoubleSide;
+    m.roughness = Math.min(m.roughness, 0.05);
   }
-  if (m.name.startsWith('Leaves') || m.name === 'Shrub' || m.name === 'Grass' || m.name === 'Lawn') m.envMapIntensity = 0.4;
+  // metals: plausible anodised aluminium / steel, not chrome
+  if (m.metalness >= 0.5) m.roughness = THREE.MathUtils.clamp(m.roughness, 0.28, 0.5);
+  // solar panels are glass-covered cells, not metal
+  if (m.name === 'Solar panel') {
+    m.metalness = 0;
+    m.roughness = 0.12;
+  }
+  // foliage, lawns, bark, earth and asphalt: no sheen (the environment's sky would shine off them)
+  if (MATTE.has(m.name)) m.roughness = 1;
 }
 
 // The published artifact page can't serve .glb files, so it gets the same bytes base64-encoded

@@ -6,6 +6,7 @@ import { buildWorld } from './world.js';
 import { loadComplex } from './building.js';
 import { buildFloor } from './floor.js';
 import { WalkControls } from './walk.js';
+import { Environment, fitSunShadow, setupRenderer } from './environment.js';
 import { drawPlan, planTransform } from './plan.js';
 
 const $ = (s) => document.querySelector(s);
@@ -16,19 +17,17 @@ const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.0;
+setupRenderer(renderer); // tone mapping, exposure, soft shadows (environment.js)
 $('#stage').appendChild(renderer.domElement);
 const canvas = renderer.domElement;
 
 const scene = new THREE.Scene();
-const pmrem = new THREE.PMREMGenerator(renderer);
 
 const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.5, 6000);
 // the aerial view of the marketing render: from the land side, river and bridge behind
 const HOME = { pos: new THREE.Vector3(-12, 150, 190), target: new THREE.Vector3(5, 28, -5) };
+// what casts the sun's shadows: the towers, podium, hotel wing and the nearby trees (scene metres)
+const SHADOW_BOX = new THREE.Box3(new THREE.Vector3(-85, 0, -65), new THREE.Vector3(90, 86, 105));
 camera.position.copy(HOME.pos);
 
 const controls = new OrbitControls(camera, canvas);
@@ -42,19 +41,10 @@ controls.autoRotate = true;
 controls.autoRotateSpeed = 0.35;
 
 const world = buildWorld(scene);
-// reflections: the sky dome with a bright sun, so glass and car paint reflect the real sky
-{
-  const envScene = new THREE.Scene();
-  envScene.add(world.sky.clone());
-  const sunDisc = new THREE.Mesh(new THREE.SphereGeometry(60, 16, 8), new THREE.MeshBasicMaterial({ color: new THREE.Color(14, 13, 11) }));
-  sunDisc.position.copy(world.sun.position).setLength(1400);
-  envScene.add(sunDisc);
-  const ground = new THREE.Mesh(new THREE.CircleGeometry(2400, 24).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0x55603a }));
-  ground.position.y = -40;
-  envScene.add(ground);
-  scene.environment = pmrem.fromScene(envScene, 0.02).texture;
-  scene.environmentIntensity = 0.95;
-}
+// light and reflections from the HDRI (a procedural sky stands in until it has loaded)
+const env = new Environment(renderer, scene, world);
+fitSunShadow(world.sun, SHADOW_BOX);
+requestAnimationFrame(() => env.loadHDRI());
 const walk = new WalkControls(camera, canvas);
 
 let building = null; // set once the model has loaded
@@ -604,9 +594,20 @@ renderer.setAnimationLoop(() => {
     else camera.lookAt(controls.target);
     if (building) updateLabels();
   }
+  env.update();
   renderer.render(scene, camera);
 });
 
 refresh();
 // start slowly spinning right away
 lastInteraction = -1e9;
+
+// ?debug exposes the viewer for automated screenshots and measurements
+if (new URLSearchParams(location.search).has('debug')) {
+  window.__viewer = {
+    renderer, scene, camera, controls, world, env,
+    get building() { return building; },
+    envState: () => env.state,
+    hold() { lastInteraction = performance.now() + 1e9; }, // no idle auto-rotation
+  };
+}

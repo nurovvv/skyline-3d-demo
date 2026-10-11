@@ -37,14 +37,15 @@ SUN_COLOR = (1.0, 0.925, 0.83)   # ~5600 K morning sun; a bit less warm than the
 # Irradiance budget (Blender units: a sun lamp of strength S gives irradiance S on a surface facing it,
 # a uniform background of radiance L gives pi * L on a horizontal surface).
 SKY_E = 1.0                 # horizontal irradiance from the (clamped) HDRI sky, above the horizon
-SUN_SKY_RATIO = 3.2         # horizontal irradiance sun / sky; a real clear sky at 38 deg is ~4-6
+SUN_SKY_RATIO = 2.6         # horizontal irradiance sun / sky (a real clear sky at 38 deg is ~4-6; the renders are softer)
 SUN_CLAMP = 2.2             # HDRI radiance clamp (after scaling): cuts the sun and its inner aureole
-CAMERA_SKY_STRENGTH = 0.36  # Sky Texture strength for camera rays (matched to the HDRI's sky by eye)
+CAMERA_SKY_STRENGTH = 0.06  # Sky Texture strength for camera rays (zenith matched to the HDRI's zenith)
+CAMERA_SKY_AEROSOL = 1.0    # haze of the camera sky: higher = paler, brighter horizon
 
 # Exposure / view transform (chosen against images/1.jpg, see the before/after renders)
 VIEW_TRANSFORM = 'AgX'
 LOOK = 'AgX - Medium High Contrast'
-EXPOSURE = 0.0
+EXPOSURE = 0.3
 
 LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
@@ -186,20 +187,34 @@ def setup_world(scene, hdri_path=HDRI_PATH):
 
     # --- what the camera sees: physically based clear sky with a hazy horizon, no sun disc
     sky = _node(nt, 'ShaderNodeTexSky', 'Camera sky', (400, -200))
-    sv = sun_vector()
     try:
         sky.sky_type = 'MULTIPLE_SCATTERING'
     except TypeError:
         sky.sky_type = 'NISHITA'
     sky.sun_disc = False
     sky.sun_elevation = math.radians(SUN_EL)
-    # the sky texture's sun_rotation is measured like our math angle but from -Y?  It is the angle of
-    # the sun about Z with 0 = +Y... see sky_rotation(): checked by rendering, sun glow on the sun side.
     sky.sun_rotation = sky_rotation()
     sky.altitude = 0.0
     sky.air_density = 1.0
-    sky.aerosol_density = 2.2     # haze: paler, brighter horizon
+    sky.aerosol_density = CAMERA_SKY_AEROSOL
     sky.ozone_density = 1.0
+    # below the horizon (past the end of the site's ground) the camera sees the hazy horizon colour of
+    # a few degrees up instead of the sky texture's black ground: direction z -> max(z, sin 3 deg)
+    tc2 = _node(nt, 'ShaderNodeTexCoord', None, (-200, -200))
+    sep = _node(nt, 'ShaderNodeSeparateXYZ', None, (0, -200))
+    zmax = _node(nt, 'ShaderNodeMath', 'Horizon floor', (150, -260))
+    zmax.operation = 'MAXIMUM'
+    zmax.inputs[1].default_value = math.sin(math.radians(3.0))
+    comb = _node(nt, 'ShaderNodeCombineXYZ', None, (250, -200))
+    norm = _node(nt, 'ShaderNodeVectorMath', None, (300, -200))
+    norm.operation = 'NORMALIZE'
+    L(tc2.outputs['Generated'], sep.inputs[0])
+    L(sep.outputs['X'], comb.inputs['X'])
+    L(sep.outputs['Y'], comb.inputs['Y'])
+    L(sep.outputs['Z'], zmax.inputs[0])
+    L(zmax.outputs[0], comb.inputs['Z'])
+    L(comb.outputs['Vector'], norm.inputs[0])
+    L(norm.outputs['Vector'], sky.inputs['Vector'])
     cam_bg = _node(nt, 'ShaderNodeBackground', 'Camera sky bg', (900, -120))
     L(sky.outputs['Color'], cam_bg.inputs['Color'])
     cam_bg.inputs['Strength'].default_value = CAMERA_SKY_STRENGTH
@@ -282,14 +297,17 @@ def setup_render(scene, scale, samples):
 # Cycles-only material tuning (reversible)
 # ----------------------------------------------------------------------------------------------
 
-# glass: (transmission share, roughness, transmission tint gamma: tint = base ** gamma, lighter than base)
+# glass: share = transmissive share (the rest is the reflective body with the base colour), rough =
+# roughness, tint = gamma of the transmission tint (base ** tint, lighter than the base colour),
+# spec = Specular IOR Level (0.5 = plain IOR 1.5 glass, F0 4 %; higher = coated architectural glass)
 GLASS = {
-    'Window glass': (0.8, 0.03, 0.4),
-    'Curtain glass': (0.8, 0.025, 0.4),
-    'Shop glass': (0.8, 0.03, 0.4),
-    'Shop window': (0.85, 0.035, 1.0),
-    'Gallery glass': (0.85, 0.04, 1.0),
+    'Window glass': dict(share=0.75, rough=0.03, tint=0.6, spec=None),
+    'Curtain glass': dict(share=0.75, rough=0.025, tint=0.6, spec=None),
+    'Shop glass': dict(share=0.75, rough=0.03, tint=0.6, spec=None),
+    'Shop window': dict(share=0.85, rough=0.035, tint=1.0, spec=None),
+    'Gallery glass': dict(share=0.85, rough=0.04, tint=1.0, spec=None),
 }
+GLASS_DAYLIGHT = 0.5    # visible transmittance of the panes for light going into the rooms
 # other shading-only tweaks: name -> {input: value}
 SHADING = {
     'Metal': {'Metallic': 1.0, 'Roughness': 0.32},
@@ -324,9 +342,9 @@ def _output(m):
     return (act or outs or [None])[0]
 
 
-def tune_glass(m, transmission, roughness, tint_gamma):
+def tune_glass(m, share, rough, tint, spec=None):
     """Real thin glass for Cycles: Fresnel reflections dominate at grazing angles, the room behind is
-    faintly visible through a tint (base colour ** tint_gamma, lighter than the base colour, which stays
+    faintly visible through a tint (base colour ** tint, lighter than the base colour, which stays
     as the glass's body colour), shadow and diffuse rays pass so rooms behind the glass are lit, and a
     ray that already came in through glass sees the far glass as dark interior (empty floors read as
     dark rooms, not as see-through buildings)."""
@@ -335,17 +353,19 @@ def tune_glass(m, transmission, roughness, tint_gamma):
     out = _output(m)
     if bsdf is None or out is None or nt.nodes.get(_TAG + 'glass') is not None:
         return
-    rec = _ORIG.setdefault(m.name, dict(inputs={}, surface=None))
     link = out.inputs['Surface'].links
-    rec['surface'] = link[0].from_socket if link else None
-    if rec['surface'] is not bsdf.outputs['BSDF']:
+    if not link or link[0].from_node.name != bsdf.name:
         return                        # someone built a custom shader: leave it alone
+    _ORIG.setdefault(m.name, dict(inputs={}, surface=None))['surface'] = bsdf.name
+    roughness, transmission = rough, share
     _set(m, bsdf, 'Roughness', roughness)
     _set(m, bsdf, 'IOR', 1.5)
+    if spec is not None:
+        _set(m, bsdf, 'Specular IOR Level', spec)
     _set(m, bsdf, 'Transmission Weight', 0.0)      # body: reflective, with the base colour
     _set(m, bsdf, 'Alpha', 1.0)
     base = tuple(bsdf.inputs['Base Color'].default_value)
-    tint = tuple(max(0.0, c) ** tint_gamma for c in base[:3]) + (1.0,)
+    tint = tuple(max(0.0, c) ** tint for c in base[:3]) + (1.0,)
     N = lambda kind, name, x, y: _node(nt, kind, _TAG + name, (x, y))   # noqa: E731
     pane = N('ShaderNodeBsdfPrincipled', 'pane', bsdf.location.x, bsdf.location.y - 700)
     pane.inputs['Base Color'].default_value = tint
@@ -378,7 +398,8 @@ def tune_glass(m, transmission, roughness, tint_gamma):
     nt.links.new(lp.outputs['Is Shadow Ray'], let.inputs[0])
     nt.links.new(lp.outputs['Is Diffuse Ray'], let.inputs[1])
     clear = N('ShaderNodeBsdfTransparent', 'clear', out.location.x - 400, out.location.y - 300)
-    clear.inputs['Color'].default_value = tuple(0.15 + 0.85 * c for c in tint[:3]) + (1.0,)
+    tmax = max(max(tint[:3]), 1e-6)
+    clear.inputs['Color'].default_value = tuple(GLASS_DAYLIGHT * (0.7 + 0.3 * c / tmax) for c in tint[:3]) + (1.0,)
     final = N('ShaderNodeMixShader', 'glass', out.location.x - 200, out.location.y)
     nt.links.new(let.outputs[0], final.inputs['Fac'])
     nt.links.new(room.outputs['Shader'], final.inputs[1])
@@ -389,10 +410,10 @@ def tune_glass(m, transmission, roughness, tint_gamma):
 
 def tune_materials(mats=None):
     """Apply the Cycles-only glass/metal tuning to the materials that exist (by name)."""
-    for name, (tr, rough, gamma) in GLASS.items():
+    for name, g in GLASS.items():
         m = bpy.data.materials.get(name)
         if m is not None and m.use_nodes:
-            tune_glass(m, tr, rough, gamma)
+            tune_glass(m, **g)
     for name, vals in SHADING.items():
         m = bpy.data.materials.get(name)
         if m is None or not m.use_nodes:
